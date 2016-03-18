@@ -4,6 +4,7 @@ var xml2js = require("xml2js");
 var http = require("http");
 var querystring = require("querystring");
 var _ = require('lodash');
+var fs = require('fs')
 var GoogleAuth = require("google-auth-library");
 
 var GOOGLE_FEED_URL = "https://spreadsheets.google.com/feeds/";
@@ -22,7 +23,7 @@ var GooogleSpreadsheet = function( ss_key, auth_id, options ){
   var auth_mode = 'anonymous';
 
   var auth_client = new GoogleAuth();
-  var jwt_client;
+  var jwt_client, oauth2client;
 
   options = options || {};
 
@@ -50,7 +51,7 @@ var GooogleSpreadsheet = function( ss_key, auth_id, options ){
   // deprecated username/password login method
   // leaving it here to help notify users why it doesn't work
   this.setAuth = function( username, password, cb ){
-    return cb(new Error('Google has officially deprecated ClientLogin. Please upgrade this module and see the readme for more instrucations'))
+    return cb(new Error('Google has officially deprecated ClientLogin. Please upgrade this module and see the readme for more instructions'))
   }
 
   this.useServiceAccountAuth = function( creds, cb ){
@@ -64,6 +65,89 @@ var GooogleSpreadsheet = function( ss_key, auth_id, options ){
     jwt_client = new auth_client.JWT(creds.client_email, null, creds.private_key, GOOGLE_AUTH_SCOPE, null);
     renewJwtAuth(cb);
   }
+
+  /*
+    asantos00
+    Implemented login with the user account (needing user to confirm permissions and give code back)
+  */
+
+  this.userAccountAuth = function(credentials, cb){
+    var self = this;
+    try {
+      readPreviousToken(function(token){
+        if(token){
+          token = token.toString();
+          refreshToken.call(self, credentials, token, cb)
+        }else{
+          oauth2client = new auth_client.OAuth2(credentials.client_id, credentials.client_secret, credentials.redirect_uris[0]);
+          getNewOAuth2Token(cb)
+        }
+      })
+
+    } catch (err) {
+      return cb(err);
+    }
+  }
+
+  // Gets the new token by the stored refresh token
+  function refreshToken(credentials, newAccessToken,  cb){
+    var self = this;
+    var refresher = new auth_client.UserRefreshClient(credentials.client_id, credentials.client_secret, newAccessToken)
+    refresher.refreshToken_(null, function(err, token){
+      self.setAuthToken({
+        type: token.token_type,
+        value: token.access_token,
+        expires: token.expiry_date,
+        refresh_token: token.refresh_token
+      });
+      cb()
+    })
+  }
+
+  // Generates an url for the user to grant permissions to the app
+  function getNewOAuth2Token(cb){
+    auth_mode = 'oAuth2';
+    var generated = oauth2client.generateAuthUrl({
+      access_type: 'offline',
+      scope: GOOGLE_AUTH_SCOPE,
+      response_type: 'code'
+    });
+    // Send back the url and the getTokenFromCode function
+    cb(generated, getTokenFromCode)
+  }
+
+  // Receives the code after user accepting app permissions
+  function getTokenFromCode(code, cb){
+    oauth2client.getToken(code, function(err, token){
+      if(err) return cb(err)
+      persistRefreshToken(token.refresh_token);
+      self.setAuthToken({
+        type: token.token_type,
+        value: token.access_token,
+        expires: token.expiry_date,
+        refresh_token: token.refresh_token
+      });
+      cb(err, token)
+    });
+  }
+
+  function persistRefreshToken(refresh_token){
+    fs.writeFile('./refresh_token.json', refresh_token, function(err){
+      if (err) throw err;
+    });
+  }
+
+  function readPreviousToken(cb){
+    fs.readFile('./refresh_token.json', function(err, data){
+      if (err) return cb(null);
+      cb(data);
+    });
+  }
+
+  /*
+    asantos00
+    Implemented login with the user account (needing user to confirm permissions and give code back
+  */
 
   function renewJwtAuth(cb) {
     auth_mode = 'jwt';
@@ -109,10 +193,15 @@ var GooogleSpreadsheet = function( ss_key, auth_id, options ){
 
     async.series({
       auth: function(step) {
-        if (auth_mode != 'jwt') return step();
-        // check if jwt token is expired
+        if (auth_mode !== 'jwt' && auth_mode !== 'oAuth2') return step();
+        // check if token is expired
         if (google_auth.expires > +new Date()) return step();
-        renewJwtAuth(step);
+
+        // Call the appropriate handler for the token type
+        if(auth_mode === 'jwt')
+          renewJwtAuth(step);
+        else if(auth_mode === 'oAuth2')
+          getNewOAuth2Token(step);
       },
       request: function(result, step) {
         if ( google_auth ) {
